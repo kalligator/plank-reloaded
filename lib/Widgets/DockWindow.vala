@@ -92,6 +92,16 @@ namespace Plank {
                   | Gdk.EventMask.STRUCTURE_MASK);
 
       controller.prefs.notify["HideMode"].connect (set_struts);
+
+      // Remove WM_TAKE_FOCUS after realization and also patch sibling windows
+      realize.connect (() => {
+        remove_take_focus ();
+        // Patch the GtkApplication leader window as well
+        Idle.add (() => {
+          remove_take_focus_from_all_plank_windows ();
+          return Source.REMOVE;
+        });
+      });
     }
 
     ~DockWindow () {
@@ -310,6 +320,7 @@ namespace Plank {
      */
     public override bool map_event (Gdk.EventAny event) {
       set_struts ();
+      remove_take_focus ();
 
       return base.map_event (event);
     }
@@ -806,6 +817,87 @@ namespace Plank {
                                32, X.PropMode.Replace, (uchar[]) first_struts, first_struts.length);
       if (gdk_display.error_trap_pop () != X.Success)
         critical ("Error while setting struts");
+    }
+
+    /**
+     * Remove WM_TAKE_FOCUS from WM_PROTOCOLS to prevent focus stealing.
+     *
+     * GTK3 adds WM_TAKE_FOCUS to WM_PROTOCOLS for all toplevel windows,
+     * even when accept_focus is false. This causes EWMH window managers
+     * to allow the dock to actively request focus during unhide, which
+     * is never desired for a dock window.
+     */
+    void remove_take_focus () {
+      if (!get_realized ())
+        return;
+
+      unowned Gdk.X11.Display gdk_display = (get_display () as Gdk.X11.Display);
+      if (gdk_display == null)
+        return;
+
+      unowned Gdk.X11.Window gdk_window = (get_window () as Gdk.X11.Window);
+      if (gdk_window == null)
+        return;
+
+      unowned X.Display display = gdk_display.get_xdisplay ();
+      var xid = gdk_window.get_xid ();
+
+      X.Atom wm_protocols_atom = display.intern_atom ("WM_PROTOCOLS", false);
+      X.Atom wm_delete_window_atom = display.intern_atom ("WM_DELETE_WINDOW", false);
+      X.Atom net_wm_ping_atom = display.intern_atom ("_NET_WM_PING", false);
+
+      // Set WM_PROTOCOLS without WM_TAKE_FOCUS
+      X.Atom[] protocols = { wm_delete_window_atom, net_wm_ping_atom };
+
+      gdk_display.error_trap_push ();
+      display.change_property (xid, wm_protocols_atom, X.XA_ATOM,
+                               32, X.PropMode.Replace, (uchar[]) protocols, protocols.length);
+      if (gdk_display.error_trap_pop () != X.Success)
+        warning ("Error while removing WM_TAKE_FOCUS from WM_PROTOCOLS");
+    }
+
+    /**
+     * Remove WM_TAKE_FOCUS from all windows belonging to this process,
+     * including the GtkApplication leader window which is not directly accessible.
+     */
+    void remove_take_focus_from_all_plank_windows () {
+      unowned Gdk.X11.Display gdk_display = (get_display () as Gdk.X11.Display);
+      if (gdk_display == null)
+        return;
+
+      unowned X.Display display = gdk_display.get_xdisplay ();
+
+      X.Atom wm_protocols_atom = display.intern_atom ("WM_PROTOCOLS", false);
+      X.Atom wm_delete_window_atom = display.intern_atom ("WM_DELETE_WINDOW", false);
+      X.Atom net_wm_ping_atom = display.intern_atom ("_NET_WM_PING", false);
+
+      X.Atom[] protocols = { wm_delete_window_atom, net_wm_ping_atom };
+
+      // Patch the GtkApplication leader window (WM_CLIENT_LEADER of our window)
+      unowned Gdk.X11.Window gdk_window = (get_window () as Gdk.X11.Window);
+      if (gdk_window == null)
+        return;
+
+      var xid = gdk_window.get_xid ();
+
+      X.Atom client_leader_atom = display.intern_atom ("WM_CLIENT_LEADER", false);
+      X.Atom actual_type;
+      int actual_format;
+      ulong nitems, bytes_after;
+      void* prop_data;
+
+      gdk_display.error_trap_push ();
+      if (display.get_window_property (xid, client_leader_atom, 0, 1, false,
+                                       X.XA_WINDOW, out actual_type, out actual_format,
+                                       out nitems, out bytes_after, out prop_data) == X.Success
+          && nitems == 1 && prop_data != null) {
+        X.Window leader_xid = ((X.Window*) prop_data)[0];
+        display.change_property (leader_xid, wm_protocols_atom, X.XA_ATOM,
+                                 32, X.PropMode.Replace, (uchar[]) protocols, protocols.length);
+        X.free (prop_data);
+      }
+      if (gdk_display.error_trap_pop () != X.Success)
+        warning ("Error while patching leader window WM_PROTOCOLS");
     }
   }
 }
